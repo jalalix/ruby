@@ -3,12 +3,13 @@
 require "time"
 require "date"
 
-# JalaliX — Jalali (Persian / Shamsi) calendar for Ruby.
-# Pure Ruby port of @jalalix/typescript — same algorithm and camelCase API.
+# JalaliX - Jalali (Persian / Shamsi) calendar for Ruby.
+# Pure Ruby port of @jalalix/typescript - same algorithm and camelCase API.
 # Timezone: system zoneinfo via ENV["TZ"] when available; embedded fixed
 # offsets for golden zones (UTC, Asia/Tehran +03:30 since 2022) as fallback.
 class JalaliX
   PERSIAN_NUMBERS = %w[۰ ۱ ۲ ۳ ۴ ۵ ۶ ۷ ۸ ۹].freeze
+  ARABIC_NUMBERS = %w[٠ ١ ٢ ٣ ٤ ٥ ٦ ٧ ٨ ٩].freeze
 
   # Fixed offsets (seconds east of UTC) for zones needed without zoneinfo.
   # Asia/Tehran abolished DST in 2022 -> permanent +03:30.
@@ -530,7 +531,7 @@ class JalaliX
 
   def self.parseJalali(value, options = nil)
     normalized = fromPersian(value.to_s).strip
-    match = normalized.match(/\A(\d{4})[\/-](\d{1,2})[\/-](\d{1,2})(?:[ T](\d{1,2}):(\d{1,2})(?::(\d{1,2}))?)?\z/)
+    match = normalized.match(/\A(\d{4})[\/\-.](\d{1,2})[\/\-.](\d{1,2})(?:[ T](\d{1,2}):(\d{1,2})(?::(\d{1,2}))?)?\z/)
     raise ArgumentError, "JalaliX.parseJalali: invalid Jalali date \"#{value}\"" unless match
 
     year = match[1].to_i
@@ -557,11 +558,116 @@ class JalaliX
     out
   end
 
+  # Converts Persian (۰-۹) and Arabic-Indic (٠-٩) numerals to Western numerals (0-9).
   def self.fromPersian(str)
     out = str.dup
-    10.times { |i| out = out.gsub(PERSIAN_NUMBERS[i], i.to_s) }
+    10.times do |i|
+      out = out.gsub(PERSIAN_NUMBERS[i], i.to_s)
+      out = out.gsub(ARABIC_NUMBERS[i], i.to_s)
+    end
     out
   end
+
+  # Soft-normalizes loose query / form date inputs into a Gregorian "Y-m-d H:i:s" string.
+  #
+  # Handles empty/sentinel values (nil, "undefined", "Invalid Date", "NaN"), unix timestamps
+  # (seconds or milliseconds), Persian/Arabic digits, "/" "-" "." separators, fractional seconds,
+  # optional "Z" / offset suffixes, and auto-detects Jalali vs Gregorian by year band: years in
+  # +jalaliYearMin..jalaliYearMax+ (default 1..1899) are treated as Jalali when the civil date is
+  # valid; otherwise Gregorian.
+  #
+  # Invalid or unrecognized values are returned cleaned (digits normalized) rather than raising;
+  # sentinels and non-positive timestamps return nil. Non-string / non-numeric values pass through.
+  def self.normalizeQueryDate(value, options = nil)
+    return nil if value.nil?
+
+    if value.is_a?(String)
+      is_invalid_date = value.casecmp("Invalid Date").zero? || value.match?(/NaN/i)
+      return nil if value == "null" || value == "" || value == "undefined" || is_invalid_date
+    end
+
+    if value.is_a?(Integer) || value.is_a?(Float)
+      return normalize_query_timestamp(value.to_i, options)
+    end
+
+    if value.is_a?(String)
+      trimmed = value.strip
+      numeric = parse_numeric(trimmed)
+      return normalize_query_timestamp(numeric, options) unless numeric.nil?
+    end
+
+    return value unless value.is_a?(String)
+
+    digits = fromPersian(value)
+    digits = digits.gsub(/(\d{2}:\d{2}:\d{2})\.\d+/, '\1')
+
+    match = digits.match(
+      /\A(\d{4})[\/\-.](\d{1,2})[\/\-.](\d{1,2})(?:[ T](\d{1,2}):(\d{2})(?::(\d{2}))?(?:Z|[+-]\d{2}:?\d{2})?)?/
+    )
+    return digits unless match
+
+    year = match[1].to_i
+    month = match[2].to_i
+    day = match[3].to_i
+    hour = (match[4] || 0).to_i
+    minute = (match[5] || 0).to_i
+    second = (match[6] || 0).to_i
+
+    jalali_year_min = option_value(options, :jalaliYearMin) || 1
+    jalali_year_max = option_value(options, :jalaliYearMax) || 1899
+
+    if year >= jalali_year_min && year <= jalali_year_max && valid_jalali_civil_date?(year, month, day)
+      begin
+        return parseJalali(format("%04d/%02d/%02d %02d:%02d:%02d", year, month, day, hour, minute, second), options)
+               .format("YYYY-MM-DD HH:mm:ss", calendar: "gregorian")
+      rescue ArgumentError
+        # fall through to Gregorian / cleaned
+      end
+    end
+
+    return format("%04d-%02d-%02d %02d:%02d:%02d", year, month, day, hour, minute, second) if valid_gregorian_date?(year, month, day)
+
+    digits
+  end
+
+  def self.normalize_query_timestamp(timestamp, options)
+    timestamp = timestamp / 1000 if timestamp > 9_999_999_999
+    return nil if timestamp <= 0
+
+    create(timestamp * 1000, options).format("YYYY-MM-DD HH:mm:ss", calendar: "gregorian")
+  end
+  private_class_method :normalize_query_timestamp
+
+  def self.valid_jalali_civil_date?(year, month, day)
+    return false if year < 1 || month < 1 || month > 12 || day < 1
+    return day <= 31 if month <= 6
+    return day <= 30 if month <= 11
+
+    leap = new(0).check_leap_year(year)
+    day <= (leap ? 30 : 29)
+  end
+  private_class_method :valid_jalali_civil_date?
+
+  def self.valid_gregorian_date?(year, month, day)
+    return false if year < 1 || month < 1 || month > 12 || day < 1
+
+    Date.valid_date?(year, month, day)
+  end
+  private_class_method :valid_gregorian_date?
+
+  def self.parse_numeric(str)
+    return nil unless str.match?(/\A[+-]?\d+(\.\d+)?\z/)
+
+    str.to_f.to_i
+  end
+  private_class_method :parse_numeric
+
+  def self.option_value(options, key)
+    return nil unless options.is_a?(Hash)
+
+    options[key] || options[key.to_s]
+  end
+  private_class_method :option_value
 
   def self.compare(date, comparing)
     date.getTime < comparing.getTime
